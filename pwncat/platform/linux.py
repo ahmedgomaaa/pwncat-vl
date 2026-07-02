@@ -35,7 +35,7 @@ import pwncat
 import pwncat.channel
 import pwncat.subprocess
 from pwncat import util
-from pwncat.channel import ChannelError
+from pwncat.channel import ChannelError, ChannelTimeout
 from pwncat.gtfobins import Stream, GTFOBins, Capability, MissingBinary
 from pwncat.platform import Path, Platform, PlatformError
 
@@ -552,10 +552,17 @@ class Linux(Platform):
 
     name = "linux"
     PATH_TYPE = LinuxPath
+    # POSIX shells (sh/ash/dash) expand $(...) and $PWD in PS1, so they use a
+    # command-substitution prompt. bash, however, may have `promptvars` disabled
+    # (or run in POSIX mode), which suppresses both command substitution AND
+    # parameter expansion in PS1 -- leaving a literal `$(command printf ...)` on
+    # screen. bash *always* honors backslash prompt escapes (\u \h \w \$)
+    # regardless of promptvars, so bash gets an escape-based prompt instead.
     PROMPTS = {
         "sh": """'$(command printf "(remote) $(whoami)@$(hostname):$PWD\\$ ")'""",
         "ash": """'$(command printf "(remote) $(whoami)@$(hostname):$PWD\\$ ")'""",
         "dash": """'$(command printf "(remote) $(whoami)@$(hostname):$PWD\\$ ")'""",
+        "bash": r"""'\[\033[01;31m\](remote)\[\033[0m\] \[\033[01;33m\]\u@\h\[\033[0m\]:\[\033[1;36m\]\w\[\033[0m\]\$ '""",
         "zsh": """'%B%F{red}(remote) %B%F{yellow}%n@%M%B%F{reset}:%B%F{cyan}$PWD%B%(#.%b%F{white}#.%b%F{white}$)%b%F{reset} '""",
         "default": """'$(command printf "\\[\\033[01;31m\\](remote)\\[\\033[0m\\] \\[\\033[01;33m\\]$(whoami)@$(hostname)\\[\\033[0m\\]:\\[\\033[1;36m\\]$PWD\\[\\033[0m\\]\\$ ")'""",
     }
@@ -570,6 +577,14 @@ class Linux(Platform):
 
         self._id = None
 
+        # Before running ANY Linux-specific (and potentially destructive)
+        # bootstrap commands, make sure this is really a Unix-like shell. If it
+        # is clearly Windows, bail out now -- this raises a ChannelError which
+        # the entrypoint turns into a raw passthrough relay -- so we never
+        # corrupt a Windows shell with Linux commands. Genuine Linux shells are
+        # unaffected (see _detect_non_linux).
+        self._detect_non_linux()
+
         # This causes an stty to be sent.
         # If we aren't in a pty, it doesn't matter.
         # if we are, we need this stty to properly handle process IO
@@ -583,9 +598,11 @@ class Linux(Platform):
         )
 
         # Drain any shell startup output (e.g. "bash: no job control",
-        # MOTD, or other banners) before sending commands
-        time.sleep(0.2)
-        self.channel.drain()
+        # MOTD, or other banners) before sending commands. We use a
+        # deterministic marker handshake instead of a fixed sleep so that
+        # late-arriving startup output on high-latency links cannot bleed
+        # into the first framed command and desync the parser.
+        self._sync_shell()
 
         # Ensure history is disabled
         self.disable_history()
@@ -658,11 +675,136 @@ class Linux(Platform):
                     # Wait for the new shell to be ready by sending a sync
                     # marker and waiting for it, instead of a fixed sleep.
                     # This drains any startup output (e.g. "no job control").
-                    time.sleep(0.1)
-                    self.channel.drain()
+                    self._sync_shell()
                     break
 
         self.refresh_uid()
+
+    def _detect_non_linux(self, timeout: float = 3.0):
+        """Fast, non-destructive check that the remote really is a Unix-like
+        shell before any Linux-specific bootstrap runs.
+
+        We send a single ``uname`` (harmless on every shell) and read what
+        comes back -- which also captures any connection banner and/or the
+        shell prompt that the command elicits. A positive Unix signal
+        (``Linux``/``Darwin``/...) means proceed normally. A clear Windows
+        signature -- a cmd.exe banner, a "not recognized" error, or a Windows
+        drive-path prompt such as ``C:\\...>`` / ``PS C:\\...>`` -- means this
+        is not a Linux shell: we push the received bytes back onto the channel
+        and raise a ``ChannelError`` carrying the channel. The entrypoint
+        catches that and falls back to a raw passthrough relay instead of
+        mangling the shell with Linux commands.
+
+        Detection is deliberately conservative -- we only divert on a positive
+        Windows signal and otherwise assume Linux -- so genuine Linux shells
+        (including slow or exotic ones) are never affected.
+        """
+
+        unix_sigs = (b"linux", b"darwin", b"bsd", b"gnu", b"sunos", b"aix")
+        win_text_sigs = (
+            b"is not recognized",
+            b"not recognized as the name of a cmdlet",
+            b"microsoft windows",
+            b"windows_nt",
+            b"\\windows\\system32",
+            b"copyright (c) microsoft",
+        )
+
+        def _has_windows_drive_path(low: bytes) -> bool:
+            # Match a drive-letter path like ``c:\`` (letter, colon,
+            # backslash) -- present in both cmd.exe (``C:\...>``) and
+            # PowerShell (``PS C:\...>``) prompts, but never in Unix output.
+            for i in range(len(low) - 2):
+                if (
+                    97 <= low[i] <= 122  # a-z (already lowercased)
+                    and low[i + 1] == 0x3A  # ':'
+                    and low[i + 2] == 0x5C  # '\'
+                ):
+                    return True
+            return False
+
+        try:
+            self.channel.send(b"uname\n")
+        except ChannelError:
+            return
+
+        data = b""
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                chunk = self.channel.recv(4096)
+            except ChannelError:
+                break
+            if not chunk:
+                time.sleep(0.05)
+                continue
+            data += chunk
+            low = data.lower()
+            if any(s in low for s in unix_sigs):
+                # Confirmed Unix-like; proceed with the normal bootstrap.
+                return
+            if any(s in low for s in win_text_sigs) or _has_windows_drive_path(low):
+                # Hand the already-received output back so the raw relay can
+                # show it, then signal the non-Linux condition.
+                self.channel.unrecv(data)
+                raise ChannelError(
+                    self.channel,
+                    "remote is not a Linux shell (looks like Windows)",
+                )
+
+        # No clear signal within the timeout: assume Linux and continue.
+
+    def _sync_shell(self, timeout: float = 2.0):
+        """Deterministically flush shell startup output (job-control
+        banners, MOTD, prompts) by emitting a unique marker and reading
+        until the shell echoes it back.
+
+        The underlying socket is non-blocking, so ``channel.drain()`` only
+        clears whatever bytes have *already* arrived; pairing it with a
+        fixed ``time.sleep`` races late output on high-latency links. When
+        that output arrives after the drain, it bleeds into the first
+        framed command and desyncs the command parser, which then blocks
+        in ``recvuntil`` until it times out and the session is torn down.
+        Waiting for a marker we generated guarantees the shell has finished
+        printing its startup noise regardless of latency.
+
+        Falls back to the previous best-effort sleep+drain if the marker is
+        never seen (e.g. an exotic shell without ``echo``), so this can
+        never regress relative to the old behavior.
+        """
+
+        # A fully random marker -- random content *and* random length -- so
+        # there is no fixed substring (nor a static byte-length) for a
+        # detection rule to fingerprint.
+        marker = secrets.token_hex(secrets.choice(range(8, 17)))
+
+        # Split the marker at a random interior point around an empty quoted
+        # string: ``echo <a>""<b>``. The shell concatenates the adjacent
+        # literals, so the command *output* is the unbroken marker while the
+        # command *text* never contains it contiguously -- a PTY that echoes
+        # the command line back therefore cannot false-match.
+        split = secrets.choice(range(1, len(marker)))
+        self.channel.send(
+            b"echo " + marker[:split].encode() + b'""' + marker[split:].encode() + b"\n"
+        )
+
+        try:
+            self.channel.recvuntil(marker.encode(), timeout=timeout)
+        except ChannelTimeout:
+            # The marker never came back (e.g. a shell without `echo`).
+            # `recvuntil` spins byte-by-byte on the non-blocking socket, so
+            # the timeout is deliberately short to bound that busy-wait
+            # before we degrade to the legacy best-effort drain.
+            time.sleep(0.2)
+            self.channel.drain()
+            return
+
+        # Consume the trailing newline after the marker echo. We already
+        # have the marker, so this is best-effort with a short timeout.
+        try:
+            self.channel.recvuntil(b"\n", timeout=0.5)
+        except ChannelTimeout:
+            pass
 
     def exit(self):
         """Exit this session"""
@@ -744,7 +886,12 @@ class Linux(Platform):
 
             self._pty_failed = True
             self.session.log(
-                "no pty methods available; continuing without pty",
+                "[yellow]warning[/yellow]: could not upgrade to a PTY on the target "
+                "(no [cyan]script[/cyan]/[cyan]python[/cyan] found and the pty helper "
+                "could not be uploaded). Continuing in degraded no-PTY mode: output "
+                "newlines are normalized for display, but job control and a full TTY "
+                "are unavailable. For a proper TTY, reconnect with a PTY payload, e.g. "
+                "[cyan]python3 -c 'import pty; pty.spawn(\"/bin/bash\")'[/cyan].",
             )
             return
 
@@ -1884,6 +2031,27 @@ class Linux(Platform):
                 pass
 
             self._interactive = True
+
+    def process_output(self, data: bytes):
+        r"""Normalize victim output for local display during interactive mode.
+
+        When no remote PTY could be obtained (``has_pty`` is False) there is no
+        terminal line discipline on the victim side, so its shell emits bare
+        ``\n`` line endings. With the local terminal in raw mode those move the
+        cursor down without returning it to column 0 -- the classic "staircase"
+        where each line starts further right. We translate lone ``\n`` to
+        ``\r\n`` for display in that degraded mode.
+
+        With a PTY present the victim already sends ``\r\n``, so the stream is
+        returned untouched and the normal path is unaffected.
+        """
+
+        if not self.has_pty:
+            # Collapse any existing CRLF first so well-formed pairs are not
+            # doubled, then expand every LF back to CRLF.
+            data = data.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+
+        return data
 
     def whoami(self):
         """Get the name of the current user"""

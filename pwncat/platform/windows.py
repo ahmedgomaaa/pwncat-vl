@@ -986,6 +986,18 @@ function prompt {
         except CalledProcessError:
             return None
 
+    def context_changed(self):
+        """Notify the platform that the shell or user context changed.
+
+        The base ``Platform`` declares this abstract, so it must be
+        implemented for ``Windows`` to be instantiable at all. On Windows a
+        context change (e.g. after privilege escalation, which calls this
+        via ``commands/escalate.py``) means the current identity may differ,
+        so we re-query the cached user/admin/SYSTEM state.
+        """
+
+        self.refresh_uid()
+
     def refresh_uid(self):
         """Retrieve the current user ID. For Windows, this is done
         through System.Security.Principal.WindowsIdentity::GetCurrent().User."""
